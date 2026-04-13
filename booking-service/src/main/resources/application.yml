@@ -1,0 +1,45 @@
+spring:
+  application:
+    name: booking-service
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/delivery_booking}
+    username: ${DB_USERNAME:delivery}
+    password: ${DB_PASSWORD:delivery}
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+  flyway:
+    enabled: true
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+    consumer:
+      group-id: ${BOOKING_CONSUMER_GROUP:booking-service}
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      properties:
+        spring.json.trusted.packages: com.example.booking.dto
+        spring.json.value.default.type: com.example.booking.dto.BookingCreatedEvent
+    listener:
+      ack-mode: manual_immediate
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+
+booking:
+  reservation:
+    ttl: ${BOOKING_RESERVATION_TTL:PT15M}
+  retry:
+    max-attempts: ${BOOKING_RETRY_MAX_ATTEMPTS:3}
+    delay: ${BOOKING_RETRY_DELAY:PT30S}
+  kafka:
+    topics:
+      booking-created: ${BOOKING_CREATED_TOPIC:booking.created}
+      booking-status: ${BOOKING_STATUS_TOPIC:booking.status}
+      booking-dlq: ${BOOKING_DLQ_TOPIC:booking.dlq}

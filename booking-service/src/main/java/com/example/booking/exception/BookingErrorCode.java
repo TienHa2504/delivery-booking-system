@@ -1,0 +1,14 @@
+package com.example.booking.exception;
+
+public enum BookingErrorCode {
+    UNAUTHORIZED,
+    INVALID_REQUEST,
+    OPPORTUNITY_NOT_FOUND,
+    BOOKING_WINDOW_CLOSED,
+    SOLD_OUT,
+    ALREADY_PENDING,
+    ALREADY_BOOKED,
+    RESERVATION_ROLLBACK_FAILED,
+    BOOKING_CREATE_FAILED,
+    EVENT_PUBLISH_FAILED
+}

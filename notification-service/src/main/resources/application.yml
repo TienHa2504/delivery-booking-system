@@ -1,0 +1,31 @@
+spring:
+  application:
+    name: notification-service
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    consumer:
+      group-id: ${NOTIFICATION_CONSUMER_GROUP:notification-service}
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      properties:
+        spring.json.trusted.packages: com.example.booking.dto,com.example.batch.dto,com.example.notification.dto
+        spring.json.use.type.headers: false
+        spring.json.value.default.type: com.example.notification.dto.BookingStatusChangedEvent
+    listener:
+      ack-mode: manual_immediate
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+
+notification:
+  kafka:
+    topics:
+      booking-status: ${BOOKING_STATUS_TOPIC:booking.status}
+  redis:
+    channels:
+      booking-status: ${NOTIFICATION_BOOKING_STATUS_CHANNEL:notification:booking-status}
+  sse:
+    timeout: ${NOTIFICATION_SSE_TIMEOUT:PT30M}

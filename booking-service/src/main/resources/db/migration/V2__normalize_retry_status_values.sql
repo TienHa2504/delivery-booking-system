@@ -1,0 +1,16 @@
+ALTER TABLE retry_record
+    DROP CONSTRAINT chk_retry_record_retry_status;
+
+UPDATE retry_record
+SET retry_status = CASE retry_status
+    WHEN 'PENDING' THEN 'RETRY_PENDING'
+    WHEN 'PROCESSING' THEN 'RETRY_PROCESSING'
+    WHEN 'SUCCEEDED' THEN 'RETRY_SUCCEEDED'
+    WHEN 'FAILED' THEN 'RETRY_FAILED'
+    WHEN 'EXHAUSTED' THEN 'RETRY_EXHAUSTED'
+    ELSE retry_status
+END;
+
+ALTER TABLE retry_record
+    ADD CONSTRAINT chk_retry_record_retry_status
+        CHECK (retry_status IN ('RETRY_PENDING', 'RETRY_PROCESSING', 'RETRY_SUCCEEDED', 'RETRY_FAILED', 'RETRY_EXHAUSTED'));

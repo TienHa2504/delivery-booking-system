@@ -1,0 +1,58 @@
+spring:
+  application:
+    name: batch-service
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/delivery_booking}
+    username: ${DB_USERNAME:delivery}
+    password: ${DB_PASSWORD:delivery}
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+  batch:
+    job:
+      enabled: false
+    jdbc:
+      initialize-schema: always
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+
+booking:
+  scheduler:
+    lock-environment: ${BOOKING_SCHEDULER_LOCK_ENVIRONMENT:batch-service}
+  kafka:
+    topics:
+      booking-status: ${BOOKING_STATUS_TOPIC:booking.status}
+  retry:
+    page-size: ${BOOKING_RETRY_PAGE_SIZE:100}
+    delay: ${BOOKING_RETRY_DELAY:PT30S}
+    max-attempts: ${BOOKING_RETRY_MAX_ATTEMPTS:3}
+    schedule:
+      fixed-delay: ${BOOKING_RETRY_JOB_FIXED_DELAY:PT30S}
+      initial-delay: ${BOOKING_RETRY_JOB_INITIAL_DELAY:PT10S}
+      lock-at-most-for: ${BOOKING_RETRY_JOB_LOCK_AT_MOST_FOR:PT5M}
+      lock-at-least-for: ${BOOKING_RETRY_JOB_LOCK_AT_LEAST_FOR:PT1S}
+  reconciliation:
+    page-size: ${BOOKING_RECONCILIATION_PAGE_SIZE:100}
+    pending-timeout: ${BOOKING_PENDING_TIMEOUT:PT10M}
+    processing-timeout: ${BOOKING_PROCESSING_TIMEOUT:PT10M}
+    schedule:
+      fixed-delay: ${BOOKING_RECONCILIATION_JOB_FIXED_DELAY:PT1M}
+      initial-delay: ${BOOKING_RECONCILIATION_JOB_INITIAL_DELAY:PT20S}
+      lock-at-most-for: ${BOOKING_RECONCILIATION_JOB_LOCK_AT_MOST_FOR:PT10M}
+      lock-at-least-for: ${BOOKING_RECONCILIATION_JOB_LOCK_AT_LEAST_FOR:PT1S}
+  remaining-reconciliation:
+    page-size: ${BOOKING_REMAINING_RECONCILIATION_PAGE_SIZE:100}
+    grace-period: ${REMAINING_RECONCILE_GRACE_PERIOD:PT60S}
+    schedule:
+      fixed-delay: ${BOOKING_REMAINING_RECONCILIATION_JOB_FIXED_DELAY:PT2M}
+      initial-delay: ${BOOKING_REMAINING_RECONCILIATION_JOB_INITIAL_DELAY:PT30S}
+      lock-at-most-for: ${BOOKING_REMAINING_RECONCILIATION_JOB_LOCK_AT_MOST_FOR:PT10M}
+      lock-at-least-for: ${BOOKING_REMAINING_RECONCILIATION_JOB_LOCK_AT_LEAST_FOR:PT1S}
