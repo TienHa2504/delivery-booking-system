@@ -327,13 +327,22 @@ ShedLock is enabled with:
 - Redis 7
 - Kafka 3.8
 
-Kafka topic auto-creation is disabled. Create these topics:
+Start the full local microservice stack:
 
-```text
-booking.created
-booking.status
-booking.dlq
+```bash
+docker compose up --build
 ```
+
+Kafka topic auto-creation is disabled; the compose file creates the required `booking.created`, `booking.status`, and `booking.dlq` topics through the `kafka-init` container.
+
+Local service ports:
+
+| Service | Host Port |
+| --- | --- |
+| auth-service | `8081` |
+| booking-service | `8082` |
+| notification-service | `8083` |
+| batch-service | no HTTP port |
 
 ## Consistency Rules
 
