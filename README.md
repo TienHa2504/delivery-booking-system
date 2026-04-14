@@ -2,7 +2,7 @@
 
 Take-home Java 21 microservices project for booking delivery opportunities under high concurrency.
 
-The design goal is to prevent overselling while keeping the booking request path fast. PostgreSQL remains the final source of truth, while Redis handles realtime capacity reservation and Kafka decouples asynchronous processing, retry, reconciliation, and notification.
+The design goal is to prevent overselling, keep the first-come-first-served booking path low-latency, and stay fault tolerant under retries, duplicate messages, and partial failures. PostgreSQL remains the final source of truth, Redis handles realtime atomic reservation, and Kafka decouples asynchronous processing, retry, reconciliation, and notification.
 
 ## Tech Stack
 
@@ -37,10 +37,19 @@ Core design choices:
 
 - **DB is final truth**: booking state, retry records, dedup constraints, and audit history live in PostgreSQL.
 - **Redis is the realtime reservation layer**: remaining capacity and reservation state are updated atomically with Lua.
-- **Kafka decouples side effects**: API returns `PENDING`, then consumers process status transitions asynchronously.
+- **Kafka decouples side effects**: the API reserves capacity and returns `PENDING`, then consumers process status transitions asynchronously.
 - **Batch repairs failures**: delayed retry, stale states, and Redis drift are handled outside the request path.
 - **ShedLock prevents duplicate scheduled jobs**: only one pod runs each batch job at a time.
 - **Redis Pub/Sub supports multi-pod SSE**: status events fan out to all notification pods, and only the pod holding the client connection pushes the event.
+
+## Assumptions
+
+- A booking is for one driver and one delivery opportunity.
+- Drivers are authenticated before booking. This project keeps JWT validation simplified in `booking-service`.
+- Opportunity capacity is known before the booking window opens.
+- A delivery opportunity belongs to one region and one zone.
+- A successful booking gives the driver the right to later arrive at the facility and receive a route.
+- Downstream facility or route assignment is outside this booking system.
 
 ## Diagram 1: High-Level System Sequence
 
@@ -274,7 +283,7 @@ Accept: text/event-stream
 
 | Table | Purpose |
 | --- | --- |
-| `delivery_opportunity` | Opportunity metadata, booking window, and total capacity. |
+| `delivery_opportunity` | Opportunity metadata, region, zone, booking window, and total capacity. |
 | `booking` | Final booking state plus capacity-release idempotency flags. |
 | `retry_record` | Durable retry queue for recoverable failures. |
 | `booking_state_history` | State transition audit trail. |
@@ -321,11 +330,15 @@ ShedLock is enabled with:
 
 ## Local Infrastructure
 
-`docker-compose.yml` starts:
+`docker-compose.yml` starts the local infrastructure and services:
 
 - PostgreSQL 16
 - Redis 7
 - Kafka 3.8
+- auth-service
+- booking-service
+- batch-service
+- notification-service
 
 Start the full local microservice stack:
 
@@ -354,3 +367,17 @@ Local service ports:
 - `slot_released` prevents duplicate capacity release.
 - Kafka consumers check DB state before every transition.
 - Batch jobs repair stuck DB state and Redis drift.
+
+## Tradeoffs And Alternatives
+
+| Decision | Why |
+| --- | --- |
+| Redis Lua reservation instead of DB pessimistic locking on every request | Keeps the hot booking path low-latency under heavy concurrency while still making the capacity decrement and duplicate reservation check atomic. |
+| PostgreSQL as final source of truth | Redis can be repaired or rebuilt, but final booking state, retry records, dedup constraints, and history need durable transactional storage. |
+| Kafka async processing after `PENDING` booking insert | The API can return quickly after reserving capacity and persisting the booking, while slower side effects are handled by consumers. |
+| Batch reconciliation instead of handling every recovery inline | Keeps request handling simple and gives the system a durable way to recover from partial failures, stale states, and Redis drift. |
+| `slot_reserved` and `slot_released` flags | Capacity release must be idempotent because Kafka messages and retry jobs can run more than once. |
+
+## Future Enhancement
+
+If business later requires prioritization by zone, region, proximity, or driver quality, the system can be extended from first-come-first-served booking to a priority-based allocation model using candidate pooling and short allocation windows before final Redis reservation.
