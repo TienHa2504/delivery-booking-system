@@ -70,8 +70,8 @@ sequenceDiagram
     BookingWorker->>Redis: Sync reservation state and release capacity on final failure
     BookingWorker->>Kafka: Publish booking status or DLQ event
 
-    Kafka->>Batch: Retry and reconciliation jobs consume durable state
-    Batch->>DB: Retry failed work and reconcile stuck bookings
+    Batch->>Batch: Scheduled jobs run with ShedLock
+    Batch->>DB: Read retry records and reconcile stuck bookings
     Batch->>Redis: Repair Redis from DB truth
     Batch->>Kafka: Publish final status events
 
@@ -131,33 +131,6 @@ sequenceDiagram
     end
 ```
 
-## Diagram 3: Booking State Sequence
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant API as booking-service REST
-    participant DB as PostgreSQL
-    participant Redis as Redis
-    participant Consumer as booking-service consumer
-    participant Batch as batch-service
-
-    API->>Redis: Reserve capacity
-    API->>DB: Insert booking as PENDING
-    Consumer->>DB: PENDING -> PROCESSING
-    Consumer->>Redis: reservation state = PROCESSING
-    alt Processing succeeds
-        Consumer->>DB: PROCESSING -> CONFIRMED
-        Consumer->>Redis: reservation state = CONFIRMED
-    else Recoverable failure
-        Consumer->>DB: Create retry_record
-        Batch->>DB: Retry processing later
-    else Final failure
-        Consumer->>DB: PROCESSING -> FAILED and slot_released=true
-        Consumer->>Redis: remaining + 1 and reservation state = FAILED
-    end
-```
-
 Capacity lifecycle:
 
 | Moment | DB state | Redis remaining | Redis reservation state |
@@ -168,7 +141,7 @@ Capacity lifecycle:
 
 `slot_reserved` and `slot_released` are idempotency guards. They prevent duplicate consumers or retry jobs from releasing the same capacity more than once.
 
-## Diagram 4: Async Processing And Retry
+## Diagram 3: Async Processing And Retry
 
 ```mermaid
 sequenceDiagram
@@ -179,6 +152,7 @@ sequenceDiagram
     participant Redis as Redis
     participant Status as Kafka booking.status
     participant DLQ as Kafka booking.dlq
+    participant DLQConsumer as booking-service DLQ consumer
     participant RetryJob as batch-service Retry Job
 
     Created->>Consumer: BOOKING_CREATED
@@ -198,7 +172,8 @@ sequenceDiagram
             Consumer->>Status: Publish CONFIRMED
         else Recoverable / infrastructure failure
             Consumer->>DLQ: Publish BookingDlqEvent
-            DLQ->>DB: DLQ consumer writes retry_record
+            DLQ->>DLQConsumer: Consume BookingDlqEvent
+            DLQConsumer->>DB: Write retry_record
             RetryJob->>DB: Scan RETRY_PENDING records
             RetryJob->>DB: Retry and update booking
             RetryJob->>Redis: Sync reservation state or release capacity
@@ -211,7 +186,7 @@ sequenceDiagram
     end
 ```
 
-## Diagram 5: Batch Jobs Sequence
+## Diagram 4: Batch Jobs Sequence
 
 `batch-service` has exactly three jobs.
 
@@ -266,30 +241,7 @@ sequenceDiagram
 - Repairs Redis remaining from DB truth only.
 - Never updates DB from Redis.
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Job as Remaining Reconciliation Job
-    participant DB as PostgreSQL
-    participant Redis as Redis
-
-    Job->>DB: Page delivery_opportunity
-    loop Each opportunity
-        Job->>DB: Has recent PENDING/PROCESSING after grace cutoff?
-        alt Hot opportunity
-            Job->>Job: Skip to avoid early repair
-        else Eligible opportunity
-            Job->>DB: Read capacity
-            Job->>DB: Count PENDING, PROCESSING, CONFIRMED
-            Job->>Redis: Read actual remaining
-            alt actual != expected
-                Job->>Redis: SET remaining = expected_remaining
-            end
-        end
-    end
-```
-
-## Diagram 6: Multi-Pod Notification
+## Diagram 5: Multi-Pod Notification
 
 SSE connections are held in memory by the pod that accepted the client connection. To support multiple notification pods, `notification-service` fans Kafka status events out through Redis Pub/Sub.
 
