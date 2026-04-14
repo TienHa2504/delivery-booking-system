@@ -213,24 +213,24 @@ sequenceDiagram
 
 ```mermaid
 flowchart TB
-    Scheduler[BatchJobScheduler<br/>@Scheduled + @SchedulerLock]
+    Scheduler["BatchJobScheduler with ShedLock"]
 
-    Scheduler --> RetryJob[1. Retry Job]
-    Scheduler --> StatusJob[2. Status Reconciliation Job]
-    Scheduler --> RemainingJob[3. Remaining Reconciliation Job]
+    Scheduler --> RetryJob["1. Retry Job"]
+    Scheduler --> StatusJob["2. Status Reconciliation Job"]
+    Scheduler --> RemainingJob["3. Remaining Reconciliation Job"]
 
-    RetryJob -->|scan retry_record<br/>RETRY_PENDING and next_retry_at <= now| RetryRecord[(retry_record)]
-    RetryJob -->|confirm or final fail| Booking[(booking)]
-    RetryJob -->|sync reservation / release capacity| Redis[(Redis)]
-    RetryJob -->|publish status| StatusTopic[Kafka booking.status]
+    RetryJob -->|"scan RETRY_PENDING retry records"| RetryRecord[("retry_record")]
+    RetryJob -->|"confirm or final fail"| Booking[("booking")]
+    RetryJob -->|"sync reservation or release capacity"| Redis[("Redis")]
+    RetryJob -->|"publish status"| StatusTopic["Kafka booking.status"]
 
-    StatusJob -->|find stale PENDING / PROCESSING| Booking
-    StatusJob -->|create retry_record or fail booking| RetryRecord
-    StatusJob -->|repair reservation state| Redis
+    StatusJob -->|"find stale PENDING or PROCESSING"| Booking
+    StatusJob -->|"create retry record or fail booking"| RetryRecord
+    StatusJob -->|"repair reservation state"| Redis
 
-    RemainingJob -->|read capacity| Opportunity[(delivery_opportunity)]
-    RemainingJob -->|count PENDING / PROCESSING / CONFIRMED| Booking
-    RemainingJob -->|set expected remaining| Redis
+    RemainingJob -->|"read capacity"| Opportunity[("delivery_opportunity")]
+    RemainingJob -->|"count capacity-holding bookings"| Booking
+    RemainingJob -->|"set expected remaining"| Redis
 ```
 
 ### Retry Job
