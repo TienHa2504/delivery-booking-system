@@ -42,49 +42,41 @@ Core design choices:
 - **ShedLock prevents duplicate scheduled jobs**: only one pod runs each batch job at a time.
 - **Redis Pub/Sub supports multi-pod SSE**: status events fan out to all notification pods, and only the pod holding the client connection pushes the event.
 
-## Diagram 1: System Architecture
+## Diagram 1: High-Level System Sequence
 
 ```mermaid
-flowchart LR
-    Driver["Driver Client"]
+sequenceDiagram
+    autonumber
+    actor Driver
+    participant Auth as auth-service
+    participant BookingApi as booking-service REST API
+    participant Redis as Redis reservation layer
+    participant DB as PostgreSQL source of truth
+    participant Kafka as Kafka
+    participant BookingWorker as booking-service consumer
+    participant Batch as batch-service
+    participant Notification as notification-service
 
-    subgraph App["Application Services"]
-        Auth["auth-service"]
-        BookingApi["booking-service REST API"]
-        BookingWorker["booking-service Kafka Consumer"]
-        Batch["batch-service Spring Batch"]
-        Notification["notification-service SSE"]
-    end
+    Driver->>Auth: Authenticate
+    Driver->>BookingApi: POST /api/bookings
+    BookingApi->>DB: Load opportunity and validate booking window
+    BookingApi->>Redis: Atomic Lua reserve capacity and dedup key
+    BookingApi->>DB: Insert booking as PENDING
+    BookingApi->>Kafka: Publish BOOKING_CREATED
+    BookingApi-->>Driver: Return booking status PENDING
 
-    subgraph Infra["Infrastructure"]
-        DB[("PostgreSQL Final Source of Truth")]
-        Redis[("Redis Remaining and Reservation State")]
-        Kafka[("Kafka topics")]
-        RedisPubSub[("Redis PubSub Notification Fanout")]
-    end
+    Kafka->>BookingWorker: Consume BOOKING_CREATED
+    BookingWorker->>DB: Move PENDING to PROCESSING then CONFIRMED or FAILED
+    BookingWorker->>Redis: Sync reservation state and release capacity on final failure
+    BookingWorker->>Kafka: Publish booking status or DLQ event
 
-    Driver -->|"JWT and POST /api/bookings"| BookingApi
-    Driver --> Auth
+    Kafka->>Batch: Retry and reconciliation jobs consume durable state
+    Batch->>DB: Retry failed work and reconcile stuck bookings
+    Batch->>Redis: Repair Redis from DB truth
+    Batch->>Kafka: Publish final status events
 
-    BookingApi -->|"load opportunity and validate window"| DB
-    BookingApi -->|"Lua atomic reserve"| Redis
-    BookingApi -->|"insert PENDING booking"| DB
-    BookingApi -->|"publish BOOKING_CREATED"| Kafka
-
-    Kafka -->|"consume BOOKING_CREATED"| BookingWorker
-    BookingWorker -->|"state transitions"| DB
-    BookingWorker -->|"sync reservation state"| Redis
-    BookingWorker -->|"publish status or DLQ event"| Kafka
-
-    Kafka -->|"retry and status events"| Batch
-    Batch -->|"retry and reconcile"| DB
-    Batch -->|"repair Redis from DB truth"| Redis
-    Batch -->|"publish status events"| Kafka
-
-    Kafka -->|"consume booking.status"| Notification
-    Notification -->|"publish fanout event"| RedisPubSub
-    RedisPubSub -->|"all notification pods receive"| Notification
-    Notification -->|"SSE status update"| Driver
+    Kafka->>Notification: Consume booking.status
+    Notification-->>Driver: Push status update through SSE
 ```
 
 ## Diagram 2: Booking Request Sequence
@@ -139,19 +131,31 @@ sequenceDiagram
     end
 ```
 
-## Diagram 3: Booking State Machine
+## Diagram 3: Booking State Sequence
 
 ```mermaid
-stateDiagram-v2
-    [*] --> PENDING: Redis reserve + DB insert
-    PENDING --> PROCESSING: BOOKING_CREATED consumed
-    PROCESSING --> CONFIRMED: processing success
-    PENDING --> FAILED: stale pending timeout
-    PROCESSING --> FAILED: non-recoverable error or retry exhausted
-    PROCESSING --> PROCESSING: recoverable retry
+sequenceDiagram
+    autonumber
+    participant API as booking-service REST
+    participant DB as PostgreSQL
+    participant Redis as Redis
+    participant Consumer as booking-service consumer
+    participant Batch as batch-service
 
-    CONFIRMED --> CONFIRMED: duplicate Kafka message ignored
-    FAILED --> FAILED: duplicate failure ignored
+    API->>Redis: Reserve capacity
+    API->>DB: Insert booking as PENDING
+    Consumer->>DB: PENDING -> PROCESSING
+    Consumer->>Redis: reservation state = PROCESSING
+    alt Processing succeeds
+        Consumer->>DB: PROCESSING -> CONFIRMED
+        Consumer->>Redis: reservation state = CONFIRMED
+    else Recoverable failure
+        Consumer->>DB: Create retry_record
+        Batch->>DB: Retry processing later
+    else Final failure
+        Consumer->>DB: PROCESSING -> FAILED and slot_released=true
+        Consumer->>Redis: remaining + 1 and reservation state = FAILED
+    end
 ```
 
 Capacity lifecycle:
@@ -207,30 +211,37 @@ sequenceDiagram
     end
 ```
 
-## Diagram 5: Batch Reconciliation Jobs
+## Diagram 5: Batch Jobs Sequence
 
 `batch-service` has exactly three jobs.
 
 ```mermaid
-flowchart TB
-    Scheduler["BatchJobScheduler with ShedLock"]
+sequenceDiagram
+    autonumber
+    participant Scheduler as BatchJobScheduler with ShedLock
+    participant RetryJob as Retry Job
+    participant StatusJob as Status Reconciliation Job
+    participant RemainingJob as Remaining Reconciliation Job
+    participant DB as PostgreSQL
+    participant Redis as Redis
+    participant Kafka as Kafka booking.status
 
-    Scheduler --> RetryJob["1. Retry Job"]
-    Scheduler --> StatusJob["2. Status Reconciliation Job"]
-    Scheduler --> RemainingJob["3. Remaining Reconciliation Job"]
+    Scheduler->>RetryJob: Run when retry schedule fires
+    RetryJob->>DB: Scan RETRY_PENDING retry_record rows
+    RetryJob->>DB: Confirm booking or mark final FAILED
+    RetryJob->>Redis: Sync reservation state or release capacity
+    RetryJob->>Kafka: Publish CONFIRMED or FAILED
 
-    RetryJob -->|"scan RETRY_PENDING retry records"| RetryRecord[("retry_record")]
-    RetryJob -->|"confirm or final fail"| Booking[("booking")]
-    RetryJob -->|"sync reservation or release capacity"| Redis[("Redis")]
-    RetryJob -->|"publish status"| StatusTopic["Kafka booking.status"]
+    Scheduler->>StatusJob: Run when status reconciliation schedule fires
+    StatusJob->>DB: Find stale PENDING or PROCESSING bookings
+    StatusJob->>DB: Create retry_record or mark FAILED
+    StatusJob->>Redis: Repair reservation state
+    StatusJob->>Kafka: Publish FAILED when final
 
-    StatusJob -->|"find stale PENDING or PROCESSING"| Booking
-    StatusJob -->|"create retry record or fail booking"| RetryRecord
-    StatusJob -->|"repair reservation state"| Redis
-
-    RemainingJob -->|"read capacity"| Opportunity[("delivery_opportunity")]
-    RemainingJob -->|"count capacity-holding bookings"| Booking
-    RemainingJob -->|"set expected remaining"| Redis
+    Scheduler->>RemainingJob: Run when remaining reconciliation schedule fires
+    RemainingJob->>DB: Read opportunity capacity
+    RemainingJob->>DB: Count PENDING, PROCESSING, CONFIRMED bookings
+    RemainingJob->>Redis: Set expected remaining capacity
 ```
 
 ### Retry Job
