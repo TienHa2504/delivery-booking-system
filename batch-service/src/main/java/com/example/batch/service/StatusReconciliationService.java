@@ -4,13 +4,16 @@ import com.example.batch.common.BatchConstants;
 import com.example.batch.domain.Booking;
 import com.example.batch.domain.BookingStateHistory;
 import com.example.batch.domain.BookingStatus;
+import com.example.batch.domain.DeliveryOpportunity;
 import com.example.batch.domain.RetryRecord;
 import com.example.batch.domain.RetryStatus;
+import com.example.batch.kafka.BookingCreatedEventProducer;
 import com.example.batch.kafka.BookingStatusEventProducer;
 import com.example.batch.redis.BookingRedisKeys;
 import com.example.batch.redis.BookingReservationStore;
 import com.example.batch.repository.BookingRepository;
 import com.example.batch.repository.BookingStateHistoryRepository;
+import com.example.batch.repository.DeliveryOpportunityRepository;
 import com.example.batch.repository.RetryRecordRepository;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
@@ -27,6 +30,8 @@ import java.util.UUID;
 @Service
 public class StatusReconciliationService {
 
+    private static final int MAX_ERROR_LENGTH = 1_000;
+
     private static final List<RetryStatus> ACTIVE_RETRY_STATUSES = List.of(
             RetryStatus.RETRY_PENDING,
             RetryStatus.RETRY_PROCESSING
@@ -34,12 +39,15 @@ public class StatusReconciliationService {
 
     private final BookingRepository bookingRepository;
     private final BookingStateHistoryRepository bookingStateHistoryRepository;
+    private final DeliveryOpportunityRepository deliveryOpportunityRepository;
     private final RetryRecordRepository retryRecordRepository;
     private final BookingReservationStore bookingReservationStore;
+    private final BookingCreatedEventProducer bookingCreatedEventProducer;
     private final BookingStatusEventProducer bookingStatusEventProducer;
     private final Duration pendingTimeout;
     private final Duration processingTimeout;
     private final Duration retryDelay;
+    private final Duration bookingCreatedEventPublishRetryDelay;
     private final int maxRetry;
     private final int pageSize;
     private final TransactionTemplate itemTransactionTemplate;
@@ -47,24 +55,30 @@ public class StatusReconciliationService {
     public StatusReconciliationService(
             BookingRepository bookingRepository,
             BookingStateHistoryRepository bookingStateHistoryRepository,
+            DeliveryOpportunityRepository deliveryOpportunityRepository,
             RetryRecordRepository retryRecordRepository,
             BookingReservationStore bookingReservationStore,
+            BookingCreatedEventProducer bookingCreatedEventProducer,
             BookingStatusEventProducer bookingStatusEventProducer,
             PlatformTransactionManager transactionManager,
             @Value(BatchConstants.Reconciliation.PENDING_TIMEOUT) Duration pendingTimeout,
             @Value(BatchConstants.Reconciliation.PROCESSING_TIMEOUT) Duration processingTimeout,
             @Value(BatchConstants.Retry.DELAY) Duration retryDelay,
+            @Value(BatchConstants.BookingCreatedEventPublish.RETRY_DELAY) Duration bookingCreatedEventPublishRetryDelay,
             @Value(BatchConstants.Retry.MAX_ATTEMPTS) int maxRetry,
             @Value(BatchConstants.Reconciliation.PAGE_SIZE) int pageSize
     ) {
         this.bookingRepository = bookingRepository;
         this.bookingStateHistoryRepository = bookingStateHistoryRepository;
+        this.deliveryOpportunityRepository = deliveryOpportunityRepository;
         this.retryRecordRepository = retryRecordRepository;
         this.bookingReservationStore = bookingReservationStore;
+        this.bookingCreatedEventProducer = bookingCreatedEventProducer;
         this.bookingStatusEventProducer = bookingStatusEventProducer;
         this.pendingTimeout = pendingTimeout;
         this.processingTimeout = processingTimeout;
         this.retryDelay = retryDelay;
+        this.bookingCreatedEventPublishRetryDelay = bookingCreatedEventPublishRetryDelay;
         this.maxRetry = maxRetry;
         this.pageSize = pageSize;
         this.itemTransactionTemplate = new TransactionTemplate(transactionManager);
@@ -73,17 +87,17 @@ public class StatusReconciliationService {
 
     public void reconcile() {
         Instant now = Instant.now();
-        reconcileStalePending(now.minus(pendingTimeout));
+        reconcilePending(now, now.minus(pendingTimeout));
         reconcileStaleProcessing(now.minus(processingTimeout));
         cleanupOrphanRedisReservations();
     }
 
-    private void reconcileStalePending(Instant cutoff) {
-        bookingRepository.findByStatusAndUpdatedAtLessThanEqual(BookingStatus.PENDING, cutoff).stream()
+    private void reconcilePending(Instant now, Instant staleCutoff) {
+        bookingRepository.findPendingBookingsForStatusReconciliation(staleCutoff, now).stream()
                 .limit(pageSize)
                 .map(Booking::getBookingId)
                 .forEach(bookingId -> itemTransactionTemplate.executeWithoutResult(status ->
-                        failStalePendingIfNoProgress(bookingId)
+                        reDriveOrFailStalePending(bookingId)
                 ));
     }
 
@@ -105,17 +119,40 @@ public class StatusReconciliationService {
     }
 
     @Transactional
-    public void failStalePendingIfNoProgress(UUID bookingId) {
+    public void reDriveOrFailStalePending(UUID bookingId) {
         Booking booking = bookingRepository.findByIdForUpdate(bookingId)
                 .orElseThrow(() -> new IllegalStateException("Booking does not exist"));
         if (booking.getStatus() != BookingStatus.PENDING) {
             return;
         }
+
+        DeliveryOpportunity opportunity = deliveryOpportunityRepository.findById(booking.getOpportunityId())
+                .orElseThrow(() -> new IllegalStateException("Delivery opportunity does not exist"));
+        if (Instant.now().isAfter(opportunity.getBookingWindowEnd())) {
+            failBooking(
+                    booking,
+                    BatchConstants.Error.STALE_PENDING_BOOKING_WINDOW_EXPIRED,
+                    BatchConstants.StateReason.STALE_PENDING_BOOKING_WINDOW_EXPIRED
+            );
+            return;
+        }
+
         if (hasActiveRetry(booking.getBookingId())) {
             return;
         }
 
-        failBooking(booking, BatchConstants.Error.STALE_PENDING_TIMEOUT, BatchConstants.StateReason.STALE_PENDING_RECONCILED);
+        if (booking.getBookingCreatedEventRetryCount() >= maxRetry) {
+            failBooking(
+                    booking,
+                    booking.isBookingCreatedEventPublished()
+                            ? BatchConstants.Error.STALE_PENDING_TIMEOUT
+                            : BatchConstants.Error.STALE_PENDING_BOOKING_CREATED_EVENT_NOT_PUBLISHED,
+                    BatchConstants.StateReason.STALE_PENDING_RECONCILED
+            );
+            return;
+        }
+
+        publishOrRecordPendingRedriveFailure(booking);
     }
 
     @Transactional
@@ -165,6 +202,48 @@ public class StatusReconciliationService {
 
     private boolean hasActiveRetry(UUID bookingId) {
         return retryRecordRepository.existsByBookingIdAndRetryStatusIn(bookingId, ACTIVE_RETRY_STATUSES);
+    }
+
+    private void publishOrRecordPendingRedriveFailure(Booking booking) {
+        boolean wasPublished = booking.isBookingCreatedEventPublished();
+        try {
+            bookingCreatedEventProducer.publishBookingCreated(booking);
+            booking.setBookingCreatedEventPublished(true);
+            booking.setBookingCreatedEventPublishedAt(Instant.now());
+            booking.setBookingCreatedEventLastError(null);
+            if (wasPublished) {
+                booking.setBookingCreatedEventRetryCount(booking.getBookingCreatedEventRetryCount() + 1);
+                recordPendingRedriveHistory(booking);
+            }
+        } catch (RuntimeException ex) {
+            booking.setBookingCreatedEventRetryCount(booking.getBookingCreatedEventRetryCount() + 1);
+            booking.setBookingCreatedEventNextRetryAt(Instant.now().plus(bookingCreatedEventPublishRetryDelay));
+            booking.setBookingCreatedEventLastError(truncate(errorMessage(ex)));
+            booking.setLastErrorCode(wasPublished
+                    ? BatchConstants.Error.STALE_PENDING_BOOKING_CREATED_EVENT_REDRIVE_FAILED
+                    : BatchConstants.Error.STALE_PENDING_BOOKING_CREATED_EVENT_NOT_PUBLISHED);
+        }
+    }
+
+    private void recordPendingRedriveHistory(Booking booking) {
+        bookingStateHistoryRepository.save(BookingStateHistory.builder()
+                .id(UUID.randomUUID())
+                .bookingId(booking.getBookingId())
+                .fromState(BookingStatus.PENDING)
+                .toState(BookingStatus.PENDING)
+                .reason(BatchConstants.StateReason.STALE_PENDING_REDRIVE_REQUESTED)
+                .build());
+    }
+
+    private String errorMessage(RuntimeException ex) {
+        return ex.getMessage() == null ? ex.getClass().getSimpleName() : ex.getMessage();
+    }
+
+    private String truncate(String value) {
+        if (value.length() <= MAX_ERROR_LENGTH) {
+            return value;
+        }
+        return value.substring(0, MAX_ERROR_LENGTH);
     }
 
     private void failBooking(Booking booking, String errorCode, String reason) {

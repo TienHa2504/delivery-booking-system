@@ -38,6 +38,8 @@ booking:
   retry:
     max-attempts: ${BOOKING_RETRY_MAX_ATTEMPTS:3}
     delay: ${BOOKING_RETRY_DELAY:PT30S}
+  booking-created-event-publish:
+    retry-delay: ${BOOKING_CREATED_EVENT_PUBLISH_RETRY_DELAY:PT10S}
   kafka:
     topics:
       booking-created: ${BOOKING_CREATED_TOPIC:booking.created}

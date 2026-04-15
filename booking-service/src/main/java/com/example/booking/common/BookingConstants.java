@@ -61,6 +61,14 @@ public final class BookingConstants {
         }
     }
 
+    public static final class BookingCreatedEventPublish {
+
+        public static final String RETRY_DELAY = "${booking.booking-created-event-publish.retry-delay:PT10S}";
+
+        private BookingCreatedEventPublish() {
+        }
+    }
+
     public static final class Reservation {
 
         public static final String TTL = "${booking.reservation.ttl}";

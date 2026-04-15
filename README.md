@@ -2,7 +2,7 @@
 
 Take-home Java 21 microservices project for booking delivery opportunities under high concurrency.
 
-The design goal is to prevent overselling, keep the first-come-first-served booking path low-latency, and stay fault tolerant under retries, duplicate messages, and partial failures. PostgreSQL remains the final source of truth, Redis handles realtime atomic reservation, and Kafka decouples asynchronous processing, retry, reconciliation, and notification.
+The design goal is to prevent overselling, keep the first-come-first-served booking path low-latency, and stay fault tolerant under retries, duplicate messages, Kafka publish failures, and partial failures. PostgreSQL remains the final source of truth, Redis handles realtime atomic reservation, and Kafka decouples asynchronous processing, retry, reconciliation, and notification.
 
 ## Tech Stack
 
@@ -29,7 +29,7 @@ The system is split into four services:
 | Service | Main role |
 | --- | --- |
 | `auth-service` | Auth boundary placeholder. JWT validation is simplified in `booking-service` for this exercise. |
-| `booking-service` | Booking API, Redis atomic reservation, DB insert, Kafka producer/consumer, DLQ retry-record creation. |
+| `booking-service` | Booking API, Redis atomic reservation, DB insert, booking-created publish retry marker, Kafka producer/consumer, DLQ retry-record creation. |
 | `batch-service` | Spring Batch jobs for retry, stuck-status reconciliation, and Redis remaining-capacity reconciliation. |
 | `notification-service` | Consumes booking status events and pushes updates to clients through SSE. |
 
@@ -38,6 +38,7 @@ Core design choices:
 - **DB is final truth**: booking state, retry records, dedup constraints, and audit history live in PostgreSQL.
 - **Redis is the realtime reservation layer**: remaining capacity and reservation state are updated atomically with Lua.
 - **Kafka decouples side effects**: the API reserves capacity and returns `PENDING`, then consumers process status transitions asynchronously.
+- **Booking-created publish is recoverable**: `BOOKING_CREATED` is published inline for low latency, while `Status Reconciliation Job` can retry or re-drive the event if the booking remains `PENDING`.
 - **Batch repairs failures**: delayed retry, stale states, and Redis drift are handled outside the request path.
 - **ShedLock prevents duplicate scheduled jobs**: only one pod runs each batch job at a time.
 - **Redis Pub/Sub supports multi-pod SSE**: status events fan out to all notification pods, and only the pod holding the client connection pushes the event.
@@ -70,8 +71,9 @@ sequenceDiagram
     Driver->>BookingApi: POST /api/bookings
     BookingApi->>DB: Load opportunity and validate booking window
     BookingApi->>Redis: Atomic Lua reserve capacity and dedup key
-    BookingApi->>DB: Insert booking as PENDING
+    BookingApi->>DB: Insert booking as PENDING with event_published=false
     BookingApi->>Kafka: Publish BOOKING_CREATED
+    BookingApi->>DB: Mark event_published=true after publish succeeds
     BookingApi-->>Driver: Return booking status PENDING
 
     Kafka->>BookingWorker: Consume BOOKING_CREATED
@@ -82,7 +84,7 @@ sequenceDiagram
     Batch->>Batch: Scheduled jobs run with ShedLock
     Batch->>DB: Read retry records and reconcile stuck bookings
     Batch->>Redis: Repair Redis from DB truth
-    Batch->>Kafka: Publish final status events
+    Batch->>Kafka: Re-drive stuck BOOKING_CREATED events and publish final status events
 
     Kafka->>Notification: Consume booking.status
     Notification-->>Driver: Push status update through SSE
@@ -96,8 +98,10 @@ The request path keeps DB access limited:
 - Check Redis remaining key.
 - Only if Redis remaining is missing, count DB bookings to initialize Redis.
 - Reserve capacity through Redis Lua.
-- Insert the booking as `PENDING` in DB.
-- Publish `BOOKING_CREATED`.
+- Insert the booking as `PENDING` in DB with `booking_created_event_published=false`.
+- Publish `BOOKING_CREATED` inline.
+- Mark `booking_created_event_published=true` after publish succeeds.
+- If inline publish fails, keep the booking `PENDING` and let `Status Reconciliation Job` retry it.
 
 ```mermaid
 sequenceDiagram
@@ -107,6 +111,7 @@ sequenceDiagram
     participant DB as PostgreSQL
     participant Redis as Redis Lua
     participant Kafka as Kafka
+    participant StatusJob as batch-service Status Reconciliation Job
 
     Client->>API: POST /api/bookings(driverId, opportunityId)
     API->>API: Validate JWT and request body
@@ -129,10 +134,27 @@ sequenceDiagram
     alt Redis reserve failed
         API-->>Client: Business error
     else Redis reserve succeeded
-        API->>DB: Insert booking(status=PENDING, slot_reserved=true)
+        API->>DB: Insert booking(status=PENDING, slot_reserved=true, event_published=false)
         alt DB insert succeeded
             API->>Kafka: Publish BOOKING_CREATED
+            alt Kafka publish succeeded
+                API->>DB: Mark event_published=true
+            else Kafka publish failed
+                API->>DB: Record publish error and next retry time
+            end
             API-->>Client: bookingId, status=PENDING
+            opt Later PENDING reconciliation
+                StatusJob->>DB: Scan stale or publish-due PENDING bookings
+                StatusJob->>DB: Check booking window on delivery_opportunity
+                alt booking window expired
+                    StatusJob->>DB: Mark FAILED
+                    StatusJob->>Redis: Release reserved capacity once
+                    StatusJob->>Kafka: Publish FAILED
+                else booking window still open
+                    StatusJob->>Kafka: Retry or re-drive BOOKING_CREATED
+                    StatusJob->>DB: Mark event_published=true on success
+                end
+            end
         else DB insert failed
             API->>Redis: Rollback reservation and increment remaining
             API-->>Client: Booking create error
@@ -197,7 +219,7 @@ sequenceDiagram
 
 ## Diagram 4: Batch Jobs Sequence
 
-`batch-service` has exactly three jobs.
+`batch-service` has exactly three Spring Batch jobs.
 
 ```mermaid
 sequenceDiagram
@@ -208,7 +230,7 @@ sequenceDiagram
     participant RemainingJob as Remaining Reconciliation Job
     participant DB as PostgreSQL
     participant Redis as Redis
-    participant Kafka as Kafka booking.status
+    participant Kafka as Kafka
 
     Scheduler->>RetryJob: Run when retry schedule fires
     RetryJob->>DB: Scan RETRY_PENDING retry_record rows
@@ -218,9 +240,10 @@ sequenceDiagram
 
     Scheduler->>StatusJob: Run when status reconciliation schedule fires
     StatusJob->>DB: Find stale PENDING or PROCESSING bookings
-    StatusJob->>DB: Create retry_record or mark FAILED
+    StatusJob->>DB: Check opportunity booking window for stale PENDING
+    StatusJob->>DB: Fail expired PENDING or create retry_record for stale PROCESSING
     StatusJob->>Redis: Repair reservation state
-    StatusJob->>Kafka: Publish FAILED when final
+    StatusJob->>Kafka: Re-drive BOOKING_CREATED or publish FAILED when final
 
     Scheduler->>RemainingJob: Run when remaining reconciliation schedule fires
     RemainingJob->>DB: Read opportunity capacity
@@ -238,8 +261,14 @@ sequenceDiagram
 
 ### Status Reconciliation Job
 
-- Finds stale `PENDING` bookings and fails them if no recovery exists.
-- Finds stale `PROCESSING` bookings and creates retry records first.
+- Finds stale `PENDING` bookings and publish-due `PENDING` bookings where `BOOKING_CREATED` was not delivered.
+- Loads `delivery_opportunity` and checks the booking window before recovery.
+- If the booking window has expired, it marks the booking `FAILED`, releases Redis capacity once, and publishes `FAILED`.
+- If the booking window is still open and `BOOKING_CREATED` was never published, it publishes the event and marks `booking_created_event_published=true` on success.
+- If the event was already published but the booking is still `PENDING`, it re-publishes `BOOKING_CREATED` without resetting the publish marker. This is safe because the consumer is idempotent and only processes bookings that are still `PENDING`.
+- Only after retry exhaustion does it mark stale `PENDING` as `FAILED`, release Redis capacity once, and publish `FAILED`.
+- Finds stale `PROCESSING` bookings and creates retry records first because processing already started and should be retried before final failure.
+- Marks stale `PROCESSING` as `FAILED` only when retry attempts are exhausted.
 - Cleans orphan Redis reservations when no DB booking exists.
 
 ### Remaining Reconciliation Job
@@ -284,7 +313,7 @@ Accept: text/event-stream
 | Table | Purpose |
 | --- | --- |
 | `delivery_opportunity` | Opportunity metadata, region, zone, booking window, and total capacity. |
-| `booking` | Final booking state plus capacity-release idempotency flags. |
+| `booking` | Final booking state, capacity-release idempotency flags, and booking-created Kafka publish marker. |
 | `retry_record` | Durable retry queue for recoverable failures. |
 | `booking_state_history` | State transition audit trail. |
 
@@ -306,6 +335,7 @@ expected_remaining = delivery_opportunity.capacity - used_capacity
 | Area | Files |
 | --- | --- |
 | Booking request path | `booking-service/.../BookingController`, `BookingService`, `BookingReservationStore`, Redis Lua scripts |
+| Booking-created publish recovery | `booking-service/.../BookingCreatedEventPublishService`, `batch-service/.../StatusReconciliationService` |
 | Booking consumer path | `BookingCreatedConsumer`, `BookingStateTransitionService`, `BookingDeadLetterConsumer` |
 | Retry job | `batch-service/.../job/retry/*`, `BookingRetryTransitionService`, `RetryBookingProcessingService` |
 | Status reconciliation | `batch-service/.../job/reconciliation/*`, `StatusReconciliationService` |
@@ -364,6 +394,7 @@ Local service ports:
 - Redis Lua prevents overselling by checking remaining capacity and duplicate reservation atomically.
 - `opportunityId + driverId` is the business deduplication key.
 - DB unique constraint is the final duplicate guard.
+- `booking_created_event_published=false` means the booking exists in DB but `BOOKING_CREATED` still needs to be delivered to Kafka.
 - `slot_released` prevents duplicate capacity release.
 - Kafka consumers check DB state before every transition.
 - Batch jobs repair stuck DB state and Redis drift.
@@ -375,6 +406,7 @@ Local service ports:
 | Redis Lua reservation instead of DB pessimistic locking on every request | Keeps the hot booking path low-latency under heavy concurrency while still making the capacity decrement and duplicate reservation check atomic. |
 | PostgreSQL as final source of truth | Redis can be repaired or rebuilt, but final booking state, retry records, dedup constraints, and history need durable transactional storage. |
 | Kafka async processing after `PENDING` booking insert | The API can return quickly after reserving capacity and persisting the booking, while slower side effects are handled by consumers. |
+| Booking-level publish marker instead of a full outbox table | This project has one critical initial event, so a small marker on `booking` keeps the model simple while still recovering from Kafka publish failure after DB commit. |
 | Batch reconciliation instead of handling every recovery inline | Keeps request handling simple and gives the system a durable way to recover from partial failures, stale states, and Redis drift. |
 | `slot_reserved` and `slot_released` flags | Capacity release must be idempotent because Kafka messages and retry jobs can run more than once. |
 

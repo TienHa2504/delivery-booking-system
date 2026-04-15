@@ -9,7 +9,6 @@ import com.example.booking.dto.CreateBookingRequest;
 import com.example.booking.dto.CreateBookingResponse;
 import com.example.booking.exception.BookingErrorCode;
 import com.example.booking.exception.BookingException;
-import com.example.booking.kafka.BookingEventProducer;
 import com.example.booking.redis.BookingReservationResult;
 import com.example.booking.redis.BookingReservationStore;
 import com.example.booking.repository.BookingRepository;
@@ -38,7 +37,7 @@ public class BookingService {
     private final BookingRepository bookingRepository;
     private final BookingStateHistoryRepository bookingStateHistoryRepository;
     private final BookingReservationStore bookingReservationStore;
-    private final BookingEventProducer bookingEventProducer;
+    private final BookingCreatedEventPublishService bookingCreatedEventPublishService;
     private final TransactionTemplate transactionTemplate;
     private final Clock clock;
 
@@ -47,14 +46,14 @@ public class BookingService {
             BookingRepository bookingRepository,
             BookingStateHistoryRepository bookingStateHistoryRepository,
             BookingReservationStore bookingReservationStore,
-            BookingEventProducer bookingEventProducer,
+            BookingCreatedEventPublishService bookingCreatedEventPublishService,
             TransactionTemplate transactionTemplate
     ) {
         this.deliveryOpportunityRepository = deliveryOpportunityRepository;
         this.bookingRepository = bookingRepository;
         this.bookingStateHistoryRepository = bookingStateHistoryRepository;
         this.bookingReservationStore = bookingReservationStore;
-        this.bookingEventProducer = bookingEventProducer;
+        this.bookingCreatedEventPublishService = bookingCreatedEventPublishService;
         this.transactionTemplate = transactionTemplate;
         this.clock = Clock.systemUTC();
     }
@@ -90,7 +89,7 @@ public class BookingService {
             );
         }
 
-        bookingEventProducer.publishBookingCreated(booking);
+        bookingCreatedEventPublishService.publishImmediatelyOrScheduleRetry(booking);
 
         return new CreateBookingResponse(
                 booking.getBookingId(),
@@ -145,6 +144,9 @@ public class BookingService {
                         .slotReserved(true)
                         .slotReleased(false)
                         .retryCount(0)
+                        .bookingCreatedEventPublished(false)
+                        .bookingCreatedEventRetryCount(0)
+                        .bookingCreatedEventNextRetryAt(Instant.now(clock))
                         .build();
 
                 Booking saved = bookingRepository.saveAndFlush(pendingBooking);

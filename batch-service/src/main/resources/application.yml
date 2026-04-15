@@ -19,6 +19,8 @@ spring:
     producer:
       key-serializer: org.apache.kafka.common.serialization.StringSerializer
       value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      properties:
+        spring.json.add.type.headers: false
   data:
     redis:
       host: ${REDIS_HOST:localhost}
@@ -29,7 +31,10 @@ booking:
     lock-environment: ${BOOKING_SCHEDULER_LOCK_ENVIRONMENT:batch-service}
   kafka:
     topics:
+      booking-created: ${BOOKING_CREATED_TOPIC:booking.created}
       booking-status: ${BOOKING_STATUS_TOPIC:booking.status}
+  booking-created-event-publish:
+    retry-delay: ${BOOKING_CREATED_EVENT_PUBLISH_RETRY_DELAY:PT10S}
   retry:
     page-size: ${BOOKING_RETRY_PAGE_SIZE:100}
     delay: ${BOOKING_RETRY_DELAY:PT30S}

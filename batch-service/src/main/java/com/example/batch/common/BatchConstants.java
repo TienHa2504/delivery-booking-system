@@ -20,6 +20,7 @@ public final class BatchConstants {
 
     public static final class Kafka {
 
+        public static final String BOOKING_CREATED_TOPIC = "${booking.kafka.topics.booking-created}";
         public static final String BOOKING_STATUS_TOPIC = "${booking.kafka.topics.booking-status}";
 
         private Kafka() {
@@ -28,6 +29,7 @@ public final class BatchConstants {
 
     public static final class EventType {
 
+        public static final String BOOKING_CREATED = "BOOKING_CREATED";
         public static final String BOOKING_STATUS_CHANGED = "BOOKING_STATUS_CHANGED";
 
         private EventType() {
@@ -39,6 +41,8 @@ public final class BatchConstants {
         public static final String RETRY_JOB_CONFIRMED = "RETRY_JOB_CONFIRMED";
         public static final String RETRY_JOB_FAILED = "RETRY_JOB_FAILED";
         public static final String STALE_PENDING_RECONCILED = "STALE_PENDING_RECONCILED";
+        public static final String STALE_PENDING_REDRIVE_REQUESTED = "STALE_PENDING_REDRIVE_REQUESTED";
+        public static final String STALE_PENDING_BOOKING_WINDOW_EXPIRED = "STALE_PENDING_BOOKING_WINDOW_EXPIRED";
         public static final String STALE_PROCESSING_RETRY_EXHAUSTED = "STALE_PROCESSING_RETRY_EXHAUSTED";
 
         private StateReason() {
@@ -54,6 +58,9 @@ public final class BatchConstants {
         public static final String RETRY_SLOT_ALREADY_RELEASED = "RETRY_SLOT_ALREADY_RELEASED";
         public static final String RETRY_BOOKING_NOT_RETRYABLE = "RETRY_BOOKING_NOT_RETRYABLE";
         public static final String STALE_PENDING_TIMEOUT = "STALE_PENDING_TIMEOUT";
+        public static final String STALE_PENDING_BOOKING_WINDOW_EXPIRED = "STALE_PENDING_BOOKING_WINDOW_EXPIRED";
+        public static final String STALE_PENDING_BOOKING_CREATED_EVENT_NOT_PUBLISHED = "STALE_PENDING_BOOKING_CREATED_EVENT_NOT_PUBLISHED";
+        public static final String STALE_PENDING_BOOKING_CREATED_EVENT_REDRIVE_FAILED = "STALE_PENDING_BOOKING_CREATED_EVENT_REDRIVE_FAILED";
         public static final String STALE_PROCESSING_TIMEOUT = "STALE_PROCESSING_TIMEOUT";
         public static final String ORPHAN_REDIS_RESERVATION = "ORPHAN_REDIS_RESERVATION";
 
@@ -72,6 +79,14 @@ public final class BatchConstants {
         public static final String SCHEDULE_LOCK_AT_LEAST_FOR = "${booking.retry.schedule.lock-at-least-for:PT1S}";
 
         private Retry() {
+        }
+    }
+
+    public static final class BookingCreatedEventPublish {
+
+        public static final String RETRY_DELAY = "${booking.booking-created-event-publish.retry-delay:PT10S}";
+
+        private BookingCreatedEventPublish() {
         }
     }
 

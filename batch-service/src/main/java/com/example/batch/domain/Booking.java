@@ -64,6 +64,21 @@ public class Booking {
     @Column(name = "last_error_code", length = 128)
     private String lastErrorCode;
 
+    @Column(name = "booking_created_event_published", nullable = false)
+    private boolean bookingCreatedEventPublished;
+
+    @Column(name = "booking_created_event_published_at")
+    private Instant bookingCreatedEventPublishedAt;
+
+    @Column(name = "booking_created_event_retry_count", nullable = false)
+    private int bookingCreatedEventRetryCount;
+
+    @Column(name = "booking_created_event_next_retry_at", nullable = false)
+    private Instant bookingCreatedEventNextRetryAt;
+
+    @Column(name = "booking_created_event_last_error")
+    private String bookingCreatedEventLastError;
+
     @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt;
 
@@ -75,6 +90,9 @@ public class Booking {
         Instant now = Instant.now();
         createdAt = now;
         updatedAt = now;
+        if (bookingCreatedEventNextRetryAt == null) {
+            bookingCreatedEventNextRetryAt = now;
+        }
     }
 
     @PreUpdate
